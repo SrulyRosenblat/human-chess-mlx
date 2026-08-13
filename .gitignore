@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 *.log
+artifacts/
 run.log
 surfaces.txt
 surface-verify-prompt.md

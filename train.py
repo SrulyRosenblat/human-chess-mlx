@@ -1,20 +1,30 @@
-"""
-Autoresearch pretraining script. Single-device, single-file.
-Apple Silicon MLX port of karpathy/autoresearch.
-Usage: uv run train.py
-"""
+"""Train the human-chess next-move model on Apple Silicon with MLX."""
 
+import argparse
 import gc
+import json
 import math
 import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader
+from prepare import (
+    DATA_DIR,
+    LENGTH_BUCKETS,
+    MAX_SEQ_LEN,
+    TEST_GAMES,
+    TIME_BUDGET,
+    Tokenizer,
+    VAL_GAMES,
+    evaluate_move_bits,
+    make_dataloader,
+)
+from checkpointing import load_checkpoint, save_checkpoint, save_rotating_snapshot
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
@@ -369,7 +379,7 @@ HEAD_DIM = 128
 WINDOW_PATTERN = "SSSL"
 
 # v0.1: AdamW only. Muon port is future work.
-TOTAL_BATCH_SIZE = 2**16
+TOTAL_BATCH_SIZE = 2**13
 EMBEDDING_LR = 0.6
 UNEMBEDDING_LR = 0.004
 MATRIX_LR = 0.04
@@ -381,10 +391,61 @@ WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
 
 # Model size
-DEPTH = 4
+DEPTH = 6
 DEVICE_BATCH_SIZE = 16
-FINAL_EVAL_BATCH_SIZE = 256
+FINAL_EVAL_BATCH_SIZE = 64
 STARTUP_EXCLUDE_STEPS = 1
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train the human-chess MLX model")
+    schedule = parser.add_mutually_exclusive_group()
+    schedule.add_argument(
+        "--time-budget",
+        type=float,
+        help="Total cumulative training seconds (default: 300 when no schedule is supplied).",
+    )
+    schedule.add_argument(
+        "--epochs",
+        type=int,
+        help="Train each game exactly once per epoch; learning-rate progress follows games seen.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Save a resumable, Hugging Face-ready checkpoint here.",
+    )
+    parser.add_argument("--resume", type=Path, help="Resume weights, AdamW state, and schedule progress.")
+    parser.add_argument(
+        "--checkpoint-every",
+        type=float,
+        default=1800,
+        help="Checkpoint interval in training seconds (default: 30 minutes).",
+    )
+    parser.add_argument(
+        "--snapshot-every",
+        type=float,
+        default=21600,
+        help="Rotating snapshot interval in training seconds (default: 6 hours).",
+    )
+    parser.add_argument(
+        "--keep-snapshots",
+        type=int,
+        default=12,
+        help="Number of rotating snapshots to retain (default: 12).",
+    )
+    parser.add_argument(
+        "--eval-every",
+        type=float,
+        default=0,
+        help="Run fixed validation after this many training seconds; 0 disables periodic evaluation.",
+    )
+    parser.add_argument(
+        "--history-file",
+        type=Path,
+        help="Append periodic and final validation records as JSON Lines.",
+    )
+    return parser.parse_args()
 
 
 def get_lr_multiplier(progress):
@@ -396,13 +457,31 @@ def get_lr_multiplier(progress):
     return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
 
+args = parse_args()
+if args.time_budget is None and args.epochs is None:
+    args.time_budget = TIME_BUDGET
+if args.resume and not args.output_dir:
+    args.output_dir = args.resume
+if args.time_budget is not None and args.time_budget <= 0:
+    raise SystemExit("--time-budget must be positive")
+if args.epochs is not None and args.epochs <= 0:
+    raise SystemExit("--epochs must be positive")
+if args.checkpoint_every < 0:
+    raise SystemExit("--checkpoint-every cannot be negative")
+if args.snapshot_every < 0:
+    raise SystemExit("--snapshot-every cannot be negative")
+if args.keep_snapshots <= 0:
+    raise SystemExit("--keep-snapshots must be positive")
+if args.eval_every < 0:
+    raise SystemExit("--eval-every cannot be negative")
+
 t_start = time.time()
 mx.random.seed(42)
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-x, y, epoch = next(train_loader)
+target_games = train_loader.corpus.train_games * args.epochs if args.epochs is not None else None
 t_data = time.time()
 print(f"Data/tokenizer loaded in {t_data - t_start:.1f}s")
 
@@ -422,10 +501,6 @@ model.init_weights()
 mx.eval(model.parameters())
 num_params = sum(param.size for _, param in tree_flatten(model.parameters()))
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-
 optimizer = AdamW(
     model,
     unembedding_lr=UNEMBEDDING_LR,
@@ -436,44 +511,145 @@ optimizer = AdamW(
     scalar_lr=SCALAR_LR,
 )
 
-loss_grad_fn = nn.value_and_grad(model, lambda model, inputs, targets: model(inputs, targets=targets))
-
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Gradient accumulation steps: {grad_accum_steps}")
+training_config = {
+    "total_batch_size": TOTAL_BATCH_SIZE,
+    "device_batch_size": DEVICE_BATCH_SIZE,
+    "embedding_lr": EMBEDDING_LR,
+    "unembedding_lr": UNEMBEDDING_LR,
+    "matrix_lr": MATRIX_LR,
+    "scalar_lr": SCALAR_LR,
+    "weight_decay": WEIGHT_DECAY,
+    "adam_betas": list(ADAM_BETAS),
+    "warmup_ratio": WARMUP_RATIO,
+    "warmdown_ratio": WARMDOWN_RATIO,
+    "final_lr_frac": FINAL_LR_FRAC,
+    "data_dir": str(DATA_DIR.resolve()),
+    "length_buckets": list(LENGTH_BUCKETS),
+    "validation_games": VAL_GAMES,
+    "test_games": TEST_GAMES,
+    "schedule": (
+        {"mode": "epochs", "epochs": args.epochs, "target_games": target_games}
+        if args.epochs is not None
+        else {"mode": "time", "target_seconds": args.time_budget}
+    ),
+}
 
 smooth_train_loss = 0.0
 total_training_time = 0.0
 step = 0
+processed_tokens = 0
+processed_games = 0
+last_checkpoint_time = 0.0
+last_snapshot_time = 0.0
+last_validation_time = 0.0
+if args.resume:
+    resume_state = load_checkpoint(args.resume, model, optimizer)
+    if resume_state["model_config"] != config.__dict__:
+        raise SystemExit("Checkpoint model configuration does not match train.py")
+    if resume_state.get("training_config", training_config) != training_config:
+        raise SystemExit("Checkpoint optimizer or batch configuration does not match train.py")
+    step = int(resume_state["step"])
+    processed_tokens = int(resume_state.get("total_tokens", step * TOTAL_BATCH_SIZE))
+    processed_games = int(resume_state.get("total_games", 0))
+    total_training_time = float(resume_state["training_seconds"])
+    smooth_train_loss = float(resume_state.get("smooth_train_loss", 0.0))
+    if resume_state.get("dataloader_state") is not None:
+        train_loader.load_state_dict(resume_state["dataloader_state"])
+    last_checkpoint_time = total_training_time
+    if args.snapshot_every > 0:
+        last_snapshot_time = math.floor(total_training_time / args.snapshot_every) * args.snapshot_every
+    last_validation_time = total_training_time
+    print(f"Resumed {args.resume} at step {step:,} ({total_training_time:.1f}s)")
+
+loss_sum_grad_fn = nn.value_and_grad(
+    model,
+    lambda model, inputs, targets: mx.sum(model(inputs, targets=targets, reduction="none")),
+)
+
+if target_games is not None:
+    print(f"Epoch target: {args.epochs} ({target_games:,} games total)")
+else:
+    print(f"Time budget: {args.time_budget}s total")
+print(f"Target padded tokens per optimizer step: {TOTAL_BATCH_SIZE:,}")
+
 t_compiled = None
 
-while True:
+
+def current_training_state():
+    return {
+        "step": step,
+        "training_seconds": total_training_time,
+        "total_tokens": processed_tokens,
+        "total_games": processed_games,
+        "smooth_train_loss": smooth_train_loss,
+        "training_config": training_config,
+        "dataloader_state": train_loader.state_dict(),
+    }
+
+
+def record_validation(move_bits, phase):
+    if not args.history_file:
+        return
+    args.history_file.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "phase": phase,
+        "step": step,
+        "training_seconds": total_training_time,
+        "total_tokens": processed_tokens,
+        "total_games": processed_games,
+        "num_params": num_params,
+    }
+    entry["test_move_bits" if phase == "test" else "val_move_bits"] = move_bits
+    with args.history_file.open("a") as handle:
+        handle.write(json.dumps(entry, sort_keys=True) + "\n")
+
+def training_complete():
+    if target_games is not None:
+        return processed_games >= target_games
+    return step >= STARTUP_EXCLUDE_STEPS and total_training_time >= args.time_budget
+
+
+while not training_complete():
     t0 = time.time()
     accum_grads = None
-    train_loss = None
+    step_loss_sum = 0.0
+    step_valid_moves = 0
+    step_padded_tokens = 0
+    step_games = 0
 
-    for _ in range(grad_accum_steps):
-        loss, grads = loss_grad_fn(model, x, y)
-        mx.eval(loss, grads)
+    while step_padded_tokens < TOTAL_BATCH_SIZE:
+        x, y, epoch = next(train_loader)
+        loss_sum, grads = loss_sum_grad_fn(model, x, y)
+        mx.eval(loss_sum, grads)
         if t_compiled is None:
             t_compiled = time.time()
             print(f"Model compiled in {t_compiled - t_data:.1f}s")
-        train_loss = loss
+        valid_moves = int(mx.sum(y != -1).item())
+        step_loss_sum += float(loss_sum.item())
+        step_valid_moves += valid_moves
+        step_padded_tokens += int(x.shape[0] * x.shape[1])
+        step_games += int(x.shape[0])
         if accum_grads is None:
             accum_grads = grads
         else:
             accum_grads = tree_map(lambda lhs, rhs: lhs + rhs, accum_grads, grads)
-        x, y, epoch = next(train_loader)
+        if target_games is not None and processed_games + step_games >= target_games:
+            break
 
-    if grad_accum_steps > 1:
-        accum_grads = tree_map(lambda grad: grad * (1.0 / grad_accum_steps), accum_grads)
+    accum_grads = tree_map(lambda grad: grad * (1.0 / max(step_valid_moves, 1)), accum_grads)
 
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
+    progress = min(
+        processed_games / target_games
+        if target_games is not None
+        else total_training_time / args.time_budget,
+        1.0,
+    )
     lrm = get_lr_multiplier(progress)
     optimizer.set_lr_multiplier(lrm)
     optimizer.update(model, accum_grads)
     mx.eval(model.parameters(), *optimizer.state)
 
-    train_loss_f = float(train_loss.item())
+    train_loss_f = step_loss_sum / max(step_valid_moves, 1)
     if train_loss_f > 100:
         print("FAIL")
         raise SystemExit(1)
@@ -481,18 +657,24 @@ while True:
     dt = time.time() - t0
     if step >= STARTUP_EXCLUDE_STEPS:
         total_training_time += dt
+    processed_tokens += step_padded_tokens
+    processed_games += step_games
 
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
     pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt) if dt > 0 else 0
-    remaining = max(0.0, TIME_BUDGET - total_training_time)
+    tok_per_sec = int(step_padded_tokens / dt) if dt > 0 else 0
+    remaining = (
+        f"{max(0, target_games - processed_games):,} games"
+        if target_games is not None
+        else f"{max(0.0, args.time_budget - total_training_time):.0f}s"
+    )
 
     print(
         f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
         f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
-        f"epoch: {epoch} | remaining: {remaining:.0f}s    ",
+        f"epoch: {epoch} | remaining: {remaining}    ",
         end="",
         flush=True,
     )
@@ -505,30 +687,77 @@ while True:
         gc.collect()
 
     step += 1
-    if step >= STARTUP_EXCLUDE_STEPS and total_training_time >= TIME_BUDGET:
-        break
-
+    if (
+        args.eval_every > 0
+        and total_training_time - last_validation_time >= args.eval_every
+        and not training_complete()
+    ):
+        print("\nStarting periodic eval...")
+        periodic_bits = evaluate_move_bits(model, tokenizer, FINAL_EVAL_BATCH_SIZE)
+        last_validation_time = total_training_time
+        record_validation(periodic_bits, "periodic")
+        print(f"Periodic val_move_bits at {total_training_time:.1f}s: {periodic_bits:.6f}")
+    if (
+        args.output_dir
+        and args.checkpoint_every > 0
+        and total_training_time - last_checkpoint_time >= args.checkpoint_every
+    ):
+        save_checkpoint(args.output_dir, model, optimizer, config, current_training_state())
+        last_checkpoint_time = total_training_time
+        print(f"\nCheckpoint saved to {args.output_dir}")
+    if (
+        args.output_dir
+        and args.snapshot_every > 0
+        and total_training_time - last_snapshot_time >= args.snapshot_every
+    ):
+        snapshot_dir = save_rotating_snapshot(
+            args.output_dir,
+            model,
+            optimizer,
+            config,
+            current_training_state(),
+            keep=args.keep_snapshots,
+        )
+        last_snapshot_time = total_training_time
+        print(f"\nRotating snapshot saved to {snapshot_dir}")
 print()
 t_train = time.time()
-print(f"Training completed in {t_train - t_compiled:.1f}s")
+training_started = t_compiled if t_compiled is not None else t_train
+print(f"Training completed in {t_train - training_started:.1f}s")
 
-total_tokens = step * TOTAL_BATCH_SIZE
+total_tokens = processed_tokens
 print("Starting final eval...")
 print(f"Final eval batch size: {FINAL_EVAL_BATCH_SIZE}")
-val_bpb = evaluate_bpb(model, tokenizer, FINAL_EVAL_BATCH_SIZE)
+val_move_bits = evaluate_move_bits(model, tokenizer, FINAL_EVAL_BATCH_SIZE, split="val")
+record_validation(val_move_bits, "final")
+test_move_bits = evaluate_move_bits(model, tokenizer, FINAL_EVAL_BATCH_SIZE, split="test")
+record_validation(test_move_bits, "test")
 t_eval = time.time()
 print(f"Final eval completed in {t_eval - t_train:.1f}s")
+
+if args.output_dir:
+    save_checkpoint(
+        args.output_dir,
+        model,
+        optimizer,
+        config,
+        current_training_state(),
+        metrics={"val_move_bits": val_move_bits, "test_move_bits": test_move_bits},
+    )
+    print(f"Publishable checkpoint saved to {args.output_dir}")
 
 steady_state_mfu = 0.0
 peak_vram_mb = get_peak_memory_mb()
 
 print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
+print(f"val_move_bits:    {val_move_bits:.6f}")
+print(f"test_move_bits:   {test_move_bits:.6f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_eval - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
 print(f"mfu_percent:      {steady_state_mfu:.2f}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
+print(f"total_games_M:    {processed_games / 1e6:.3f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")

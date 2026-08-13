@@ -1,381 +1,279 @@
-"""
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+"""Memory-mapped human-chess corpus, batching, splits, and evaluation."""
 
-Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
-
-Data and tokenizer are stored in ~/.cache/autoresearch/.
-"""
-
-import argparse
+import json
 import math
 import os
-import pickle
-import sys
-import time
-from multiprocessing import Pool
+from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
-import pyarrow.parquet as pq
-import requests
-import rustbpe
-import tiktoken
+
 
 # ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
+# Corpus and evaluation constants
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048
+MAX_SEQ_LEN = 256
 TIME_BUDGET = 300
-EVAL_TOKENS = 3 * 524288
+EVAL_GAMES = 8192
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542
-VAL_SHARD = MAX_SHARD
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as handle:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        handle.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as exc:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {exc}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2**attempt)
-    return False
-
-
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    existing = sum(
-        1 for index in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{index:05d}.parquet"))
-    )
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for result in results if result)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(name for name in os.listdir(DATA_DIR) if name.endswith(".parquet") and not name.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, name) for name in files]
-
-
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [path for path in list_parquet_files() if not path.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        parquet_file = pq.ParquetFile(filepath)
-        for rg_idx in range(parquet_file.num_row_groups):
-            row_group = parquet_file.read_row_group(rg_idx)
-            for text in row_group.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
-
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.npy")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(key): value for key, value in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
-
-    with open(tokenizer_pkl, "wb") as handle:
-        pickle.dump(enc, handle)
-
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes = np.array(token_bytes_list, dtype=np.int32)
-    np.save(token_bytes_path, token_bytes)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+ROOT = Path(__file__).resolve().parent.parent
+NEW_DATA_DIR = ROOT / "data" / "processed" / "lichess_hf_2025-01_temporal"
+LEGACY_DATA_DIR = ROOT / "data" / "processed" / "lichess_2016-06"
+new_data_ready = all(
+    (NEW_DATA_DIR / name).is_file()
+    for name in ("tokens.bin", "offsets.bin", "vocab.json", "splits.json")
+)
+DATA_DIR = Path(os.environ.get("CHESS_DATA_DIR", NEW_DATA_DIR if new_data_ready else LEGACY_DATA_DIR))
+TOKENS_PATH = DATA_DIR / "tokens.bin"
+OFFSETS_PATH = DATA_DIR / "offsets.bin"
+VOCAB_PATH = DATA_DIR / "vocab.json"
+SPLITS_PATH = DATA_DIR / "splits.json"
+SPLIT_METADATA = json.loads(SPLITS_PATH.read_text())["splits"] if SPLITS_PATH.is_file() else None
+VAL_GAMES = int(SPLIT_METADATA["val"]["games"]) if SPLIT_METADATA else 100_000
+TEST_GAMES = int(SPLIT_METADATA["test"]["games"]) if SPLIT_METADATA else 100_000
+LENGTH_BUCKETS = (64, 96, 128, 160, 192, 224, 256)
 
 
 class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
+    """Vocabulary metadata wrapper for the already-tokenized chess corpus."""
 
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
+    def __init__(self, vocab_size: int, move_start: int):
+        self.vocab_size = vocab_size
+        self.move_start = move_start
 
     @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as handle:
-            enc = pickle.load(handle)
-        return cls(enc)
+    def from_directory(cls, _tokenizer_dir=None):
+        vocab = json.loads(VOCAB_PATH.read_text())
+        vocab_size = int(vocab["size"])
+        move_start = vocab_size - 1968
+        labels = vocab["id_to_token"]
+        assert labels[0] == "PAD"
+        assert labels[move_start] == "a1a2"
+        return cls(vocab_size, move_start)
 
     def get_vocab_size(self):
-        return self.enc.n_vocab
+        return self.vocab_size
 
-    def get_bos_token_id(self):
-        return self.bos_token_id
 
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
+class ChessCorpus:
+    """Memory-mapped games with chronological train/validation/test splits."""
+
+    def __init__(self):
+        self.tokens = np.memmap(TOKENS_PATH, dtype="<u2", mode="r")
+        self.offsets = np.memmap(OFFSETS_PATH, dtype="<u8", mode="r")
+        self.games = len(self.offsets) - 1
+        assert self.games > VAL_GAMES + TEST_GAMES
+        assert int(self.offsets[-1]) == len(self.tokens)
+        if SPLIT_METADATA:
+            self.train_games = int(SPLIT_METADATA["train"]["games"])
+            self.val_start = int(SPLIT_METADATA["val"]["start_game"])
+            self.test_start = int(SPLIT_METADATA["test"]["start_game"])
+            assert self.val_start == self.train_games
+            assert self.test_start == self.val_start + VAL_GAMES
+            assert int(SPLIT_METADATA["test"]["end_game_exclusive"]) == self.games
         else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
+            self.train_games = self.games - VAL_GAMES - TEST_GAMES
+            self.val_start = self.train_games
+            self.test_start = self.train_games + VAL_GAMES
 
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes():
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.npy")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing token_bytes lookup at {path}. Run prepare.py first.")
-    token_bytes = np.load(path)
-    return mx.array(token_bytes, dtype=mx.int32)
+    def game(self, index: int):
+        start = int(self.offsets[index])
+        end = int(self.offsets[index + 1])
+        return self.tokens[start:end]
 
 
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [path for path in parquet_paths if path != val_path]
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            parquet_file = pq.ParquetFile(filepath)
-            for rg_idx in range(parquet_file.num_row_groups):
-                row_group = parquet_file.read_row_group(rg_idx)
-                batch = row_group.column("text").to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i + tokenizer_batch_size], epoch
-        epoch += 1
+_CORPUS = None
 
 
-def make_dataloader(tokenizer, batch_size, seq_len, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = seq_len + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
-
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    while True:
-        all_rows = []
-        for _ in range(batch_size):
-            row = []
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-                best_idx = -1
-                best_len = 0
-                for index, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = index
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row.extend(doc)
-                    pos += len(doc)
-                else:
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda index: len(doc_buffer[index]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row.extend(doc[:remaining])
-                    pos += remaining
-
-            all_rows.append(row[:row_capacity])
-
-        row_array = mx.array(all_rows, dtype=mx.int32)
-        inputs = row_array[:, :-1]
-        targets = row_array[:, 1:]
-        yield inputs, targets, epoch
+def get_corpus():
+    global _CORPUS
+    if _CORPUS is None:
+        _CORPUS = ChessCorpus()
+    return _CORPUS
 
 
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes()
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
+def _make_row(game, move_start, seq_len=MAX_SEQ_LEN):
+    """Pad one complete game and mask every non-move prediction target."""
+    row = np.zeros(seq_len + 1, dtype=np.int32)
+    usable = min(len(game), seq_len + 1)
+    row[:usable] = game[:usable]
+    inputs = row[:-1]
+    targets = row[1:]
+    valid = (targets >= move_start) & (np.arange(seq_len) < usable - 1)
+    targets = np.where(valid, targets, -1).astype(np.int32, copy=False)
+    return inputs, targets
+
+
+def _build_train_buckets(corpus, seq_len, chunk_size=1_000_000):
+    """Index every training game once using bounded temporary memory."""
+    bucket_lengths = tuple(length for length in LENGTH_BUCKETS if length <= seq_len)
+    if not bucket_lengths or bucket_lengths[-1] != seq_len:
+        bucket_lengths += (seq_len,)
+    chunks = [[] for _ in bucket_lengths]
+
+    for start in range(0, corpus.train_games, chunk_size):
+        end = min(start + chunk_size, corpus.train_games)
+        lengths = np.asarray(corpus.offsets[start + 1 : end + 1] - corpus.offsets[start:end])
+        input_lengths = np.minimum(np.maximum(lengths - 1, 1), seq_len)
+        bucket_ids = np.searchsorted(bucket_lengths, input_lengths, side="left")
+        for bucket_id in range(len(bucket_lengths)):
+            local = np.flatnonzero(bucket_ids == bucket_id)
+            if len(local):
+                chunks[bucket_id].append((local + start).astype(np.uint32))
+
+    buckets = tuple(
+        np.concatenate(parts) if parts else np.empty(0, dtype=np.uint32)
+        for parts in chunks
+    )
+    assert sum(map(len, buckets)) == corpus.train_games
+    return bucket_lengths, buckets
+
+
+class ChessDataLoader:
+    """Deterministic whole-game loader with resumable no-replacement epochs."""
+
+    def __init__(self, tokenizer, batch_size, seq_len, split, corpus=None):
+        assert seq_len == MAX_SEQ_LEN
+        assert split in {"train", "val", "test"}
+        self.tokenizer = tokenizer
+        self.base_batch_size = batch_size
+        self.seq_len = seq_len
+        self.split = split
+        self.corpus = corpus or get_corpus()
+        self.last_indices = None
+
+        if split == "train":
+            self.bucket_lengths, self.buckets = _build_train_buckets(self.corpus, seq_len)
+            max_padded_tokens = batch_size * seq_len
+            self.bucket_batch_sizes = tuple(
+                max(1, math.ceil(max_padded_tokens / length)) for length in self.bucket_lengths
+            )
+            self.epoch = 1
+            self._start_epoch(self.epoch)
+        else:
+            self.rng = np.random.default_rng(314159 if split == "val" else 271828)
+
+    def __iter__(self):
+        return self
+
+    def _start_epoch(self, epoch):
+        self.epoch = int(epoch)
+        rng = np.random.default_rng(np.random.SeedSequence([42, self.epoch]))
+        self.orders = tuple(rng.permutation(bucket) for bucket in self.buckets)
+        batch_counts = [
+            math.ceil(len(order) / batch_size)
+            for order, batch_size in zip(self.orders, self.bucket_batch_sizes)
+        ]
+        self.schedule = np.repeat(np.arange(len(self.orders), dtype=np.uint8), batch_counts)
+        rng.shuffle(self.schedule)
+        self.bucket_positions = [0] * len(self.orders)
+        self.batch_position = 0
+
+    def _next_train_indices(self):
+        if self.batch_position >= len(self.schedule):
+            self._start_epoch(self.epoch + 1)
+        bucket_id = int(self.schedule[self.batch_position])
+        self.batch_position += 1
+        start = self.bucket_positions[bucket_id]
+        end = min(start + self.bucket_batch_sizes[bucket_id], len(self.orders[bucket_id]))
+        self.bucket_positions[bucket_id] = end
+        return bucket_id, self.orders[bucket_id][start:end]
+
+    def __next__(self):
+        if self.split == "train":
+            bucket_id, indices = self._next_train_indices()
+            batch_seq_len = self.bucket_lengths[bucket_id]
+            epoch = self.epoch
+        else:
+            split_start = self.corpus.val_start if self.split == "val" else self.corpus.test_start
+            split_games = VAL_GAMES if self.split == "val" else TEST_GAMES
+            indices = split_start + self.rng.integers(0, split_games, size=self.base_batch_size)
+            batch_seq_len = self.seq_len
+            epoch = 0
+
+        self.last_indices = np.asarray(indices)
+        inputs = np.empty((len(indices), batch_seq_len), dtype=np.int32)
+        targets = np.empty_like(inputs)
+        for row_index, game_index in enumerate(indices):
+            inputs[row_index], targets[row_index] = _make_row(
+                self.corpus.game(int(game_index)), self.tokenizer.move_start, batch_seq_len
+            )
+        return mx.array(inputs), mx.array(targets), epoch
+
+    def state_dict(self):
+        if self.split != "train":
+            return None
+        return {
+            "format_version": 1,
+            "epoch": self.epoch,
+            "batch_position": self.batch_position,
+            "bucket_positions": list(self.bucket_positions),
+            "bucket_lengths": list(self.bucket_lengths),
+        }
+
+    def load_state_dict(self, state):
+        if self.split != "train":
+            raise ValueError("validation loader state is not resumable")
+        if state.get("format_version") != 1:
+            raise ValueError("unsupported dataloader checkpoint format")
+        if tuple(state["bucket_lengths"]) != self.bucket_lengths:
+            raise ValueError("checkpoint length buckets do not match the loader")
+        self._start_epoch(int(state["epoch"]))
+        positions = [int(value) for value in state["bucket_positions"]]
+        if len(positions) != len(self.orders):
+            raise ValueError("checkpoint bucket count does not match the loader")
+        if any(position < 0 or position > len(order) for position, order in zip(positions, self.orders)):
+            raise ValueError("checkpoint contains an invalid bucket position")
+        batch_position = int(state["batch_position"])
+        if not 0 <= batch_position <= len(self.schedule):
+            raise ValueError("checkpoint contains an invalid batch position")
+        self.bucket_positions = positions
+        self.batch_position = batch_position
+
+
+def make_dataloader(tokenizer, batch_size, seq_len, split, corpus=None):
+    return ChessDataLoader(tokenizer, batch_size, seq_len, split, corpus=corpus)
+
+
+def evaluate_move_bits(model, tokenizer, batch_size, split="val"):
+    """Cross-entropy in bits per human move on a fixed holdout sample."""
+    if split not in {"val", "test"}:
+        raise ValueError("evaluation split must be val or test")
+    loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, split)
+    steps = math.ceil(EVAL_GAMES / batch_size)
     total_nats = 0.0
-    total_bytes = 0
-
-    # A single forward pass materializes a (rows, MAX_SEQ_LEN, VOCAB_SIZE)
-    # float32 logits tensor. At the defaults (256 x 2048 x 8192) that is 16 GiB
-    # in one buffer, which exceeds the Metal max buffer size on 24GB Macs and
-    # OOMs the final eval (issue #2). Cap the rows per forward so no single
-    # logits tensor exceeds the budget below; BPB is a plain sum over tokens,
-    # so splitting the batch is numerically exact regardless of batch_size.
-    logits_budget_bytes = 2 * 1024**3
-    bytes_per_row = MAX_SEQ_LEN * VOCAB_SIZE * 4
-    micro_batch = max(1, min(batch_size, logits_budget_bytes // bytes_per_row))
+    total_moves = 0
 
     for _ in range(steps):
-        x, y, _ = next(val_loader)
-        for start in range(0, x.shape[0], micro_batch):
-            xb = x[start:start + micro_batch]
-            yb = y[start:start + micro_batch]
-            loss_flat = model(xb, yb, reduction="none").reshape(-1)
-            y_flat = yb.reshape(-1)
-            nbytes = mx.take(token_bytes, y_flat, axis=0)
-            mask = nbytes > 0
-            total_nats += mx.sum(loss_flat * mask).item()
-            total_bytes += int(mx.sum(nbytes).item())
-            mx.clear_cache()
+        x, y, _ = next(loader)
+        losses = model(x, y, reduction="none")
+        valid = y != -1
+        total_nats += float(mx.sum(losses).item())
+        total_moves += int(mx.sum(valid).item())
+        mx.clear_cache()
 
-    if total_bytes == 0:
+    if total_moves == 0:
         return float("inf")
-    return total_nats / (math.log(2) * total_bytes)
+    return total_nats / (math.log(2) * total_moves)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument(
-        "--num-shards",
-        type=int,
-        default=10,
-        help="Number of training shards to download (-1 = all). Val shard is always pinned.",
-    )
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    args = parser.parse_args()
-
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    tokenizer = Tokenizer.from_directory()
+    corpus = get_corpus()
+    print(f"Data: {DATA_DIR}")
+    print(f"Games: {corpus.games:,}")
+    print(f"Train games: {corpus.train_games:,}")
+    print(f"Validation games: {VAL_GAMES:,}")
+    print(f"Test games: {TEST_GAMES:,}")
+    print(f"Evaluation games per run: {EVAL_GAMES:,}")
+    print(f"Vocabulary: {tokenizer.vocab_size:,}")
+    print(f"Move token start: {tokenizer.move_start}")
+    print(f"Context: {MAX_SEQ_LEN}")
+    loader = make_dataloader(tokenizer, 4, MAX_SEQ_LEN, "train")
+    x, y, _ = next(loader)
+    assert x.shape == y.shape
+    assert x.shape[1] in loader.bucket_lengths
+    assert x.shape[0] * x.shape[1] <= 5 * MAX_SEQ_LEN
+    assert int(mx.sum(y != -1).item()) > 0
+    print("Harness check passed.")

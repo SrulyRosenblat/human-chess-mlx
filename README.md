@@ -1,100 +1,138 @@
-# autoresearch-mlx
+# Human Chess MLX
 
-Apple Silicon (MLX) port of [Karpathy's autoresearch](https://github.com/karpathy/autoresearch).
+A 14.6M-parameter language model that predicts how humans play chess. It reads
+the full game history plus both players' Elo buckets and time control, then
+scores the next move. Moves are atomic UCI tokens and a deterministic legality
+mask restricts inference to moves that can actually be played.
 
-Full credit to [@karpathy](https://github.com/karpathy) for the core idea: fixed-time autonomous research loops controlled through `program.md`. This port keeps the same basic rules: one mutable `train.py`, one metric (`val_bpb`), a fixed 5-minute training budget, and keep-or-revert via git. It runs natively on Apple Silicon through [MLX](https://github.com/ml-explore/mlx), so there is no PyTorch or CUDA dependency.
+The trained weights are available on
+[Hugging Face](https://huggingface.co/sruly/human-chess-mlx).
 
-## Quick start
+## Results
 
-Requirements: Apple Silicon Mac, Python 3.10+, [uv](https://docs.astral.sh/uv/).
+The released checkpoint was trained on 27,971,437 chronological January 2025
+Lichess games. Metrics use fixed 8,192-game holdouts from later in the month;
+the test split was evaluated only after training stopped.
+
+| Metric | Validation | Out-of-time test |
+|---|---:|---:|
+| Bits per human move | 4.099 | 4.115 |
+| Raw exact next-move accuracy | 27.68% | 27.39% |
+| Raw top-1 move is legal | 87.29% | 87.20% |
+| Legal-masked top-1 accuracy | 30.97% | 30.73% |
+| Legal-masked top-5 accuracy | 66.82% | 66.52% |
+
+Exact next-move prediction is intentionally harder than finding a good chess
+move: several moves can be reasonable, while the target is the particular move
+one human selected.
+
+## Model
+
+- 6 transformer layers, width 384, 3 attention heads
+- 14.6M parameters
+- 256-token context window
+- 2,075-token vocabulary, including 1,968 atomic UCI moves
+- Alternating 128-token sliding and 256-token full causal attention
+- Elo, time-control, result, and boundary tokens
+- Move-only loss: metadata and padding provide context but are not targets
+- Complete games per sample, with no attention across game boundaries
+
+Each stored game has this form:
+
+```text
+BOS WHITE_ELO_1625 BLACK_ELO_1675 TC_BLITZ
+e2e4 e7e5 g1f3 b8c6 ... RESULT_WHITE EOS
+```
+
+## Run the model
+
+Requirements: Apple Silicon, Python 3.10–3.13, and
+[uv](https://docs.astral.sh/uv/).
 
 ```bash
-# install uv if needed
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# install dependencies
+git clone https://github.com/SrulyRosenblat/human-chess-mlx.git
+cd human-chess-mlx
 uv sync
 
-# one-time data + tokenizer prep
-uv run prepare.py
+hf download sruly/human-chess-mlx --local-dir model
 
-# run one 5-minute training experiment
-uv run train.py
+uv run legal_inference.py model \
+  BOS WHITE_ELO_1625 BLACK_ELO_1675 TC_BLITZ \
+  e2e4 e7e5 g1f3 b8c6 \
+  --top-k 10
 ```
 
-Then point Claude Code or another coding agent at `program.md` and let it run the loop.
+`legal_inference.py` reconstructs the board from the supplied history, evaluates
+the model once, removes illegal candidates, and returns the highest-scoring
+legal continuations.
 
-## What matters
+To call it from Python:
 
-- `prepare.py` - data prep, tokenizer, dataloader, and evaluation. Treat as fixed.
-- `train.py` - model, optimizer, and training loop. This is the file the agent edits.
-- `program.md` - the autonomous experiment protocol.
-- `results.tsv` - logged experiment history.
+```python
+from chess_model import ChessTokenizer, load_model
+from legal_inference import predict_legal_moves
 
-The loop is the same as upstream: edit `train.py`, run a fixed-budget experiment, read `val_bpb`, keep the change if it wins, revert if it loses, and repeat.
+checkpoint = "model"
+tokenizer = ChessTokenizer.from_pretrained(checkpoint)
+model = load_model(checkpoint)
 
-## Public baseline results
-
-The public `results.tsv` captures the initial hardware-local walk from the default baseline down to `1.807902`:
-
-| Commit | val_bpb | Status | Description |
-|---|---:|---|---|
-| `383abb4` | 2.667000 | keep | baseline (AdamW, default config) |
-| `909dd59` | 2.588904 | keep | halve total batch size to `2^16` |
-| `4161af3` | 2.533728 | keep | increase matrix LR to `0.04` |
-| `5efc7aa` | 1.807902 | keep | reduce depth from `8` to `4` |
-
-That result already shows the core Apple Silicon pattern: with a fixed 5-minute wall clock, smaller faster-training models can beat larger ones simply by fitting more optimizer steps into the budget.
-
-## Longer Apple Silicon runs
-
-Longer overnight runs on the working MLX port pushed much further. The long Mac Mini test is included here because it found a meaningfully different winner stack from the Max-class machines.
-
-| Machine | Current best | Starting point | Repeated wins |
-|---|---:|---:|---|
-| M4 Max #1 | 1.294526 | 1.596971 | AdamW-only, low matrix LR, 3x MLP, no logit cap, moderate weight decay |
-| M4 Max #2 | 1.330509 | 1.807902 | leaner batch, long anneal, SiLU, lower regularization, no logit cap |
-| Mac Mini (long run) | 1.353329 | 1.922472 | Muon, sharper attention, smaller MLP, lower scalar LR |
-
-The Mac Mini result matters because it did not just rediscover the same exact recipe. On smaller Apple Silicon hardware, the strongest changes leaned toward more aggressive step-efficiency wins. Later transfer tests showed some of those Mac Mini findings did not carry cleanly onto the Max baseline, which is exactly the kind of hardware-specific behavior this loop is useful for uncovering.
-
-## Rigorous keep/discard (optional)
-
-A single 5-minute run is noisy — re-running the *same* `train.py` moves `val_bpb`
-by ~0.03. Deciding keep/discard on one run below that threshold just chases
-noise, and since the loop only keeps a run that dips below the running best, the
-recorded curve is an optimistic running-minimum that regresses on honest re-eval.
-
-`rigor.py` gates the decision instead of eyeballing a single delta: it runs a few
-seeds and keeps a change only if it beats the current best with high confidence
-(bootstrap), fails a clear loser fast after one run, and never re-scores an
-identical `train.py`.
-
-```
-uv run rigor.py run "halve the batch size"   # score train.py vs best (3 seeds)
-uv run rigor.py run "..." --seeds 5 --confidence 0.9
-uv run rigor.py best                          # current best
-uv run rigor.py log                           # every scored config
+history = [
+    "BOS", "WHITE_ELO_1625", "BLACK_ELO_1675", "TC_BLITZ",
+    "e2e4", "e7e5", "g1f3", "b8c6",
+]
+token_ids = tokenizer.encode_tokens(history)
+print(predict_legal_moves(model, tokenizer, token_ids, top_k=10))
 ```
 
-It never edits `train.py`, touches git, or changes `evaluate_bpb` — it only
-decides, and writes samples to `rigor_ledger.jsonl`.
+## Train
 
-## Differences from upstream
+`prepare.py` expects a tokenized corpus containing `tokens.bin`, `offsets.bin`,
+`vocab.json`, and `splits.json`. Set `CHESS_DATA_DIR` to its directory. The
+split manifest must define chronological train, validation, and test ranges.
 
-- **MLX instead of PyTorch/CUDA.** Native Apple Silicon training with unified memory.
-- **AdamW-only public path.** This public `train.py` keeps the default path simple. The long Mac Mini run above explored a Muon variant in the working port, but that branch is not exposed as a public default here.
-- **Smaller eval token budget.** Reduced for faster iteration on Apple Silicon while keeping the same `evaluate_bpb` interface in `prepare.py`.
-- **Roughly 6-7 minutes per experiment.** Expect 5 minutes of training plus compile and eval overhead.
-- **MFU reporting is placeholder.** There is no Apple Silicon equivalent to the H100 FLOPs reference used upstream.
+```bash
+CHESS_DATA_DIR=/path/to/tokenized-games uv run train.py \
+  --epochs 1 \
+  --output-dir artifacts/human-chess-mlx \
+  --checkpoint-every 1800 \
+  --snapshot-every 21600 \
+  --keep-snapshots 12
+```
 
-## Acknowledgments
+Training is deterministic and shuffled without replacement. Length bucketing
+reduces padding, checkpoints preserve the exact next-game cursor, and rotating
+snapshots provide recovery points. Resume without repeating or skipping games:
 
-- [Andrej Karpathy](https://github.com/karpathy) - autoresearch and nanochat
-- [scasella/nanochat-mlx](https://github.com/scasella/nanochat-mlx) - MLX GPT and optimizer reference
-- [awni/picochat](https://github.com/awni/picochat) - MLX training patterns
-- [Apple MLX team](https://github.com/ml-explore/mlx)
+```bash
+CHESS_DATA_DIR=/path/to/tokenized-games uv run train.py \
+  --epochs 1 \
+  --resume artifacts/human-chess-mlx \
+  --checkpoint-every 1800 \
+  --snapshot-every 21600 \
+  --keep-snapshots 12
+```
 
-## License
+Evaluate saved snapshots independently from training:
 
-MIT. See [LICENSE](LICENSE).
+```bash
+uv run evaluate_snapshots.py artifacts/human-chess-mlx/checkpoints \
+  --games 8192 --batch-size 16
+```
+
+## Code map
+
+- `chess_model.py` — standalone model, tokenizer wrapper, and checkpoint loader
+- `legal_inference.py` — board reconstruction and legal-move-masked prediction
+- `train.py` — model training and optimizer schedule
+- `prepare.py` — memory-mapped corpus, splits, batching, and move-only evaluation
+- `checkpointing.py` — resumable and Hugging Face-ready checkpoints
+- `evaluate_snapshots.py` — loss, exact accuracy, and legality metrics
+- `upload_hf.py` — filtered model upload without optimizer or training data
+- `test_training_reliability.py` — split, bucketing, resume, and snapshot tests
+
+This implementation started from Trevin Peterson's MLX port of Andrej
+Karpathy's autoresearch training harness and was adapted into the chess model
+and data pipeline here.
+
+The model weights are AGPL-3.0 on Hugging Face. This source repository has no
+declared license.
